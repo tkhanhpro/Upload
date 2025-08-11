@@ -27,7 +27,6 @@ def upload_file():
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(file_path)
         url = request.host_url + 'files/' + filename
-        # Trả JSON để frontend xử lý
         return jsonify({'success': True, 'url': url})
 
 # Serve uploaded files
@@ -35,5 +34,6 @@ def upload_file():
 def serve_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
+# Không chạy app.run() ở production, để Gunicorn xử lý
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True)  # Chỉ dùng cho dev, comment hoặc xóa ở production
