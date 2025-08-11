@@ -1,10 +1,12 @@
-from flask import Flask, request, send_from_directory, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, send_from_directory, jsonify, render_template_string
 from flask_httpauth import HTTPBasicAuth
 import os
 import uuid
 import requests
 import datetime
-import humanize  # Để format size/date (thêm vào requirements nếu cần, nhưng dùng str cho đơn giản)
+import json
+import concurrent.futures
+from requests.exceptions import RequestException
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 UPLOAD_FOLDER = 'uploads'
@@ -25,7 +27,7 @@ def verify_password(username, password):
 def index():
     return send_from_directory(app.static_folder, 'index.html')
 
-# Upload endpoint (hỗ trợ multi file)
+# Upload endpoint (hỗ trợ multi file, tối ưu với stream)
 @app.route('/upload', methods=['POST'])
 def upload_files():
     files = request.files.getlist('files')
@@ -38,38 +40,64 @@ def upload_files():
         ext = os.path.splitext(file.filename)[1]
         filename = str(uuid.uuid4()) + ext
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(file_path)
+        file.save(file_path)  # Stream save mặc định nhanh
         url = request.host_url + 'files/' + filename
         urls.append(url)
     return jsonify({'success': True, 'urls': urls})
 
-# Convert endpoint (từ URL Catbox/ImgBB/Imgur/v.v.)
+# Convert endpoint (hỗ trợ multi URL: JSON array, space/newline separated, parallel download)
 @app.route('/convert', methods=['POST'])
-def convert_url():
-    url = request.form.get('url')
-    if not url:
+def convert_urls():
+    input_data = request.form.get('urls')
+    if not input_data:
         return jsonify({'error': 'Không có URL'}), 400
     try:
-        response = requests.get(url, stream=True)
-        if response.status_code != 200:
-            return jsonify({'error': 'Không tải được file từ URL'}), 400
-        ext = os.path.splitext(url)[1] or '.bin'  # Default nếu không có ext
-        filename = str(uuid.uuid4()) + ext
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(1024):
-                f.write(chunk)
-        new_url = request.host_url + 'files/' + filename
-        return jsonify({'success': True, 'url': new_url})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Parse input: JSON array hoặc split by space/newline
+        if input_data.strip().startswith('['):
+            urls = json.loads(input_data)
+        else:
+            urls = [u.strip() for u in input_data.replace('\n', ' ').split(' ') if u.strip()]
+    except json.JSONDecodeError:
+        return jsonify({'error': 'JSON không hợp lệ'}), 400
+
+    def download_url(url):
+        try:
+            response = requests.get(url, stream=True, timeout=30)  # Thêm timeout để tránh abort
+            if response.status_code != 200:
+                return None, f'Lỗi status {response.status_code} cho {url}'
+            ext = os.path.splitext(url)[1] or '.bin'
+            filename = str(uuid.uuid4()) + ext
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(1024):
+                    f.write(chunk)
+            return request.host_url + 'files/' + filename, None
+        except RequestException as e:
+            return None, f'Lỗi kết nối cho {url}: {str(e)}'
+        except Exception as e:
+            return None, f'Lỗi không xác định cho {url}: {str(e)}'
+
+    # Parallel download với ThreadPoolExecutor để tăng tốc
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:  # Giới hạn worker để tránh overload
+        results = list(executor.map(download_url, urls))
+
+    success_urls = [r[0] for r in results if r[0]]
+    errors = [r[1] for r in results if r[1]]
+    
+    if success_urls:
+        response = {'success': True, 'urls': success_urls}
+        if errors:
+            response['warnings'] = errors
+        return jsonify(response)
+    else:
+        return jsonify({'error': 'Tất cả convert thất bại', 'details': errors}), 500
 
 # Serve uploaded files
 @app.route('/files/<filename>')
 def serve_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# Admin panel
+# Admin panel (giữ nguyên, thêm thống kê tốc độ nếu cần nhưng đơn giản)
 @app.route('/admin', methods=['GET', 'POST'])
 @auth.login_required
 def admin_panel():
@@ -134,7 +162,7 @@ def admin_panel():
     </html>
     ''', files=files, total_size=total_size, search=search)
 
-# API Docs route
+# API Docs route (cập nhật cho multi)
 @app.route('/api-docs')
 def api_docs():
     return render_template_string('''
@@ -158,19 +186,21 @@ def api_docs():
                 <li><strong>cURL</strong>: <pre>curl -X POST -F "files=@file1.jpg" -F "files=@file2.png" {{ request.host_url }}upload</pre></li>
             </ul>
             
-            <h2>2. Convert URL (POST /convert)</h2>
-            <p>Convert (tải và lưu) từ URL (Catbox, ImgBB, Imgur, v.v.).</p>
+            <h2>2. Convert URLs (POST /convert)</h2>
+            <p>Convert multi URL (JSON array, space/newline separated) từ Catbox, ImgBB, Imgur, v.v.</p>
             <ul>
-                <li><strong>Body</strong>: Form-data với key <code>url</code> (string URL).</li>
-                <li><strong>Response</strong> (JSON): <pre>{"success": true, "url": "new_url"}</pre></li>
-                <li><strong>cURL</strong>: <pre>curl -X POST -F "url=https://example.com/image.jpg" {{ request.host_url }}convert</pre></li>
+                <li><strong>Body</strong>: Form-data với key <code>urls</code> (string: JSON array hoặc "url1 url2" hoặc url1\nurl2).</li>
+                <li><strong>Response</strong> (JSON): <pre>{"success": true, "urls": ["new_url1", "new_url2"], "warnings": ["error1"]}</pre></li>
+                <li><strong>cURL</strong>: <pre>curl -X POST -F 'urls=["https://ex1.jpg", "https://ex2.jpg"]' {{ request.host_url }}convert</pre></li>
+                <li>Hoặc: <pre>curl -X POST -F "urls=https://ex1.jpg https://ex2.jpg" {{ request.host_url }}convert</pre></li>
             </ul>
             
             <h2>Giới hạn</h2>
             <ul>
                 <li>Max 100MB/file.</li>
-                <li>Hỗ trợ mọi loại media (image, video, file).</li>
-                <li>Admin API: Không public, chỉ qua /admin với auth.</li>
+                <li>Hỗ trợ mọi loại media.</li>
+                <li>Parallel processing cho multi convert để tăng tốc.</li>
+                <li>Admin API: Không public.</li>
             </ul>
             <a href="/" class="btn btn-primary">Về Trang Chủ</a>
         </div>
