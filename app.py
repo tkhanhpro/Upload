@@ -34,6 +34,6 @@ def upload_file():
 def serve_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# Không chạy app.run() ở production, để Gunicorn xử lý
 if __name__ == '__main__':
-    app.run(debug=True)  # Chỉ dùng cho dev, comment hoặc xóa ở production
+    # Chỉ dùng cho dev local, không dùng trên Render
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
